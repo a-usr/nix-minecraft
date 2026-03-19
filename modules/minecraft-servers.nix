@@ -607,6 +607,7 @@ in
                   a nix package/derivation. Can be used to declaratively manage
                   arbitrary files in the server's data directory.
                 '';
+
               files =
                 with types;
                 mkOpt' (attrsOf (either path configType)) { } ''
@@ -619,6 +620,16 @@ in
                   These files may include placeholders to substitute with values from
                   <option>services.minecraft-servers.environmentFile</option>
                   (i.e. @variable_name@).
+                '';
+
+              persistentFiles =
+                with types;
+                mkOpt' (either (attrsOf (either path configType)) path) { } ''
+                  Files to overlay into the server's data directory. These files may be located
+                  in the nix store, but are writable by deferring the write elsewhere using an
+                  overlayfs, making no changes to the files in the nix store. This also means
+                  that changes to the backing files in the nix store may not get reflected if the
+                  file has been changed non-declaratively.
                 '';
 
               managementSystem = mkOption {
@@ -747,7 +758,7 @@ in
         ))
       ];
 
-      systemd.services = mapAttrs' (
+      systemd.services = concatMapAttrs (
         name: conf:
         let
           symlinks = normalizeFiles (
@@ -797,6 +808,64 @@ in
           );
 
           msConfig = managementSystemConfig name conf;
+
+          WorkingDirectory = "${cfg.dataDir}/${name}";
+
+          OverlayFsSetup =
+            "+" # We need this to run as root (due to mount privileges)
+            + getExe (
+              pkgs.writeShellApplication {
+                name = "minecraft-server-${name}-overlayfs-setup";
+                runtimeInputs = [ pkgs.util-linux ];
+                excludeShellChecks = [ "SC2046" ];
+                text =
+                  let
+                    prefix = v: "${cfg.dataDir}/.overlayfs/${name}/${v}";
+                    psf = conf.persistentFiles;
+
+                    lowerdir =
+                      if (isStringLike psf) then
+                        throwIfNot (pathIsDirectory psf)
+                          "nix-minecraft: The option persistentFiles should be the path to a directory, or an attrset of files, but was found to be the path to a file"
+                          psf
+                      else
+
+                        pkgs.linkFarm (normalizeFiles psf);
+                    upperdir = prefix "upperdir";
+                    workdir = prefix "workdir";
+                  in
+                  ''
+                    set -x
+                    if mountpoint ${WorkingDirectory}; then exit; fi
+
+                    mkdir -p ${upperdir} ${workdir}
+                    chown minecraft: ${upperdir}
+
+                    echo "Mounting overlayfs.."
+                    mount -t overlay overlay -olowerdir=${lowerdir},upperdir=${upperdir},workdir=${workdir} ${WorkingDirectory}
+                    mountpoint ${WorkingDirectory}
+
+                    echo "Setting Permissions on mount contents.."
+                    chmod -R --no-dereference 770 ${WorkingDirectory}
+                    echo "Changing ownership of mount contents.."
+                    chown -R --no-dereference minecraft: ${WorkingDirectory}
+                  '';
+              }
+            );
+
+          OverlayFsTeardown =
+            "+"
+            + getExe (
+              pkgs.writeShellApplication {
+                name = "minecraft-server-${name}-overlayfs-teardown";
+                runtimeInputs = [ pkgs.util-linux ];
+                text = ''
+                  if ! mountpoint ${WorkingDirectory}; then exit; fi
+
+                  umount -l ${WorkingDirectory}
+                '';
+              }
+            );
 
           markManaged = file: "echo ${file} >> .nix-minecraft-managed";
           cleanAllManaged = ''
@@ -927,10 +996,11 @@ in
               '';
             }
           );
+
+          enableOverlayFs = conf.persistentFiles != { };
         in
         {
-          name = "minecraft-server-${name}";
-          value = {
+          "minecraft-server-${name}" = {
             description = "Minecraft Server ${name}";
             wantedBy = mkIf conf.autoStart [ "multi-user.target" ];
             requires = optional conf.managementSystem.systemd-socket.enable "minecraft-server-${name}.socket";
@@ -938,7 +1008,9 @@ in
             after = [
               "network.target"
             ]
-            ++ optional conf.managementSystem.systemd-socket.enable "minecraft-server-${name}.socket";
+            ++ optional conf.managementSystem.systemd-socket.enable "minecraft-server-${name}.socket"
+            ++ optional enableOverlayFs "minecraft-server-${name}-overlayfs.service";
+            bindsTo = optional enableOverlayFs "minecraft-server-${name}-overlayfs.service";
 
             enable = conf.enable;
 
@@ -952,15 +1024,14 @@ in
                 ExecStartPost
                 ExecStopPost
                 ExecReload
+                WorkingDirectory
                 ;
-              ExecStop = "${execStopScript} $MAINPID";
 
               # the Minecraft server (as of 1.20.6) has a 60s timeout for saving each world.
               # let's let it handle potential lock-ups by itself before resorting to killing it.
               TimeoutStopSec = "1min 15s";
 
               Restart = conf.restart;
-              WorkingDirectory = "${cfg.dataDir}/${name}";
               User = cfg.user;
               Group = cfg.group;
               EnvironmentFile = mkIf (cfg.environmentFile != null) (toString cfg.environmentFile);
@@ -1001,6 +1072,18 @@ in
             reloadIfChanged = conf.enableReload;
 
             inherit (conf) path environment;
+          };
+
+          "minecraft-server-${name}-overlayfs" = {
+            enable = enableOverlayFs && conf.enable;
+            description = "Minecraft Server ${name}";
+            serviceConfig = {
+              ExecStart = OverlayFsSetup;
+              Type = "oneshot";
+              RemainAfterExit = true;
+              ExecStop = OverlayFsTeardown;
+            };
+
           };
         }
       ) servers;
